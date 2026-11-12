@@ -4,6 +4,7 @@ import airportsdata
 import pycountry
 import requests
 from dotenv import load_dotenv
+from rich import print
 
 load_dotenv()
 
