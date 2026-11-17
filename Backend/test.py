@@ -1,5 +1,4 @@
-from backend import run_travel_agent
+from mcp_client import get_all_tools
+import asyncio
 
-from rich import print
-res=run_travel_agent("give me plan of 7 days to travel from india to australia")
-print(res)
+print(asyncio.run(get_all_tools()))
