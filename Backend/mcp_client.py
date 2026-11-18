@@ -41,7 +41,7 @@ WEATHER_ENV["OPENWEATHER_API_KEY"] = (
 # ==========================================
 
 llm = ChatGroq(
-    model="openai/gpt-oss-20b",
+    model="meta-llama/llama-prompt-guard-2-86m",
     api_key=GROQ_API_KEY
 )
 
