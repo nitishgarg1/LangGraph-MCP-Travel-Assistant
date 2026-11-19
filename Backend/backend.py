@@ -11,6 +11,8 @@ import operator
 import uuid
 import asyncio
 import json
+import re
+from datetime import datetime
 import psycopg
 from psycopg.rows import dict_row
 from langgraph.graph import StateGraph, START, END
@@ -22,15 +24,18 @@ from langchain_core.messages import (
     AIMessage,
     SystemMessage,
 )
-from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
 
+from flight_tools import clean_iata, fetch_live_flights
 from mcp_client import (
     tavily_mcp_search,
-    aviation_mcp_call,
     extract_destination,
     forecast_mcp_search,
     weather_mcp_search,
 )
+
+
+# =========================
 # State - original fields kept, new control fields added
 # =========================
 class TravelState(TypedDict, total=False):
@@ -50,7 +55,7 @@ class TravelState(TypedDict, total=False):
     weather_results: str
     itinerary: str
 
-    # New budget + HITL state
+    # Budget + HITL state
     budget_results: str
     approval_request: str
     approved: bool
@@ -76,37 +81,46 @@ def get_database_url():
     return database_url
 
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY is missing. Please add it to your .env file.")
-
-
 # =========================
 # LLM
 # =========================
+# ChatGoogleGenerativeAI reads GOOGLE_API_KEY from the environment (.env).
+if not os.getenv("GOOGLE_API_KEY"):
+    raise ValueError("GOOGLE_API_KEY is missing. Please add it to your .env file.")
 
-llm = ChatGroq(
-    model="openai/gpt-oss-20b",
-    api_key=GROQ_API_KEY
+llm = ChatGoogleGenerativeAI(
+    model="gemini-3.1-flash-lite",
+    temperature=0.3,
 )
 
 
-KNOWN_AGENTS = {
-    "flight_agent",
-    "hotel_agent",
-    "weather_agent",
-    "budget_agent",
-    "itinerary_agent",
-}
+# =========================
+# Text helpers
+# =========================
+def _content_to_text(content: Any) -> str:
+    """
+    Normalise anything an LLM or MCP tool can return into plain text.
 
-AGENT_ORDER = [
-    "flight_agent",
-    "hotel_agent",
-    "weather_agent",
-    "budget_agent",
-    "itinerary_agent",
-]
+    Gemini and MCP tools often return a list of content blocks such as
+    [{"type": "text", "text": "..."}] instead of a string. Without this,
+    the frontend receives lists and shows "[object Object]".
+    """
+    if content is None:
+        return ""
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, dict):
+        if "text" in content and isinstance(content["text"], str):
+            return content["text"]
+        return json.dumps(content, indent=2, default=str)
+
+    if isinstance(content, (list, tuple)):
+        parts = [_content_to_text(item) for item in content]
+        return "\n\n".join(part for part in parts if part)
+
+    return str(content)
 
 
 def _llm_text(system_prompt: str, user_prompt: str) -> str:
@@ -116,7 +130,7 @@ def _llm_text(system_prompt: str, user_prompt: str) -> str:
             HumanMessage(content=user_prompt),
         ]
     )
-    return str(response.content)
+    return _content_to_text(response.content)
 
 
 def _json_from_llm(text: str) -> dict[str, Any]:
@@ -139,6 +153,37 @@ def _empty_constraints() -> dict[str, Any]:
         "travel_style": "",
         "special_preferences": [],
     }
+
+
+KNOWN_AGENTS = {
+    "flight_agent",
+    "hotel_agent",
+    "weather_agent",
+    "budget_agent",
+    "itinerary_agent",
+}
+
+AGENT_ORDER = [
+    "flight_agent",
+    "hotel_agent",
+    "weather_agent",
+    "budget_agent",
+    "itinerary_agent",
+]
+
+
+# Shared formatting rules so the draft and the final plan look the same.
+DAY_FORMAT_RULES = """
+Format the day-by-day plan exactly like this. One block per day, no tables:
+
+### Day 1 - Tokyo: Arrival and first impressions
+- **Morning:** ...
+- **Afternoon:** ...
+- **Evening:** ...
+
+Every day must start with a "### Day N - City: short theme" heading and have
+Morning, Afternoon and Evening bullets. Keep each bullet to one or two lines.
+"""
 
 
 # =========================
@@ -288,26 +333,37 @@ def guardrail_blocked_agent(state: TravelState):
 
 
 # =========================
-# Flight Agent - original behavior kept
+# Flight Agent
 # =========================
+# Only Aviationstack's real-time `flights` endpoint is available on the current
+# plan, so the agent looks up live flights for the route and lets the LLM add
+# general knowledge (durations, seasonal pricing, booking advice).
+DEFAULT_ORIGIN_IATA = clean_iata(
+    (os.getenv("DEFAULT_ORIGIN_IATA") or "DEL").strip().strip("\"'")
+) or "DEL"
+
 FLIGHT_AGENT_PROMPT = """
 You are a travel flight expert.
 
 User Query:
 {query}
 
-Airport Information:
-{airport_data}
+Route looked up: {route}
 
-Airline Information:
-{airline_data}
+Live flight data (Aviationstack real-time flights):
+{live_flight_data}
+
+Rules:
+- The live data only shows flights operating around the current time. It cannot
+  confirm schedules for the traveler's future travel dates, and it has NO prices.
+- Clearly separate "Live observations" from "General guidance (not live)".
 
 Generate:
 1. Likely departure airport
 2. Likely arrival airport
-3. Airlines serving this route
+3. Airlines serving this route (use the live data when available)
 4. Typical flight duration
-5. Estimated airfare range
+5. Estimated airfare range (approximate, not live)
 6. Peak season pricing warning
 7. Booking advice
 
@@ -315,31 +371,66 @@ Return concise travel guidance.
 """
 
 
+def _pick_airports(state: TravelState) -> tuple[str, str | None]:
+    """Ask the LLM for the main origin and destination airport codes."""
+    prompt = f"""
+From this travel request, give the main international airport IATA code for
+the origin and for the destination. If the origin is not stated, use
+"{DEFAULT_ORIGIN_IATA}".
+
+Trip constraints:
+{state.get('trip_constraints', {})}
+
+User request:
+{state['user_query']}
+
+Return strict JSON only:
+{{"origin_iata": "", "destination_iata": ""}}
+"""
+    parsed = _json_from_llm(
+        _llm_text(
+            "You convert cities to airport codes. Return strict JSON only.",
+            prompt,
+        )
+    )
+    origin = clean_iata(parsed.get("origin_iata")) or DEFAULT_ORIGIN_IATA
+    destination = clean_iata(parsed.get("destination_iata"))
+    return origin, destination
+
+
 def flight_agent(state: TravelState):
     print("\nINSIDE FLIGHT AGENT\n")
     query = state["user_query"]
 
-    try:
-        airports = asyncio.run(aviation_mcp_call("list_airports"))
-        airlines = asyncio.run(aviation_mcp_call("list_airlines"))
+    route = "unknown"
+    live_flight_data = (
+        "Live flight data was not retrieved. Use general travel knowledge and "
+        "clearly label it as non-live."
+    )
 
-        print("\nAIRPORTS:", airports)
-        print("\nAIRLINES:", airlines)
+    try:
+        origin, destination = _pick_airports(state)
+
+        if destination:
+            route = f"{origin} -> {destination}"
+            result = fetch_live_flights(origin, destination)
+            live_flight_data = result["text"]
+            print(f"LIVE FLIGHTS ({route}): ok={result['ok']} count={result['count']}")
+        else:
+            live_flight_data = (
+                "The destination airport could not be determined, so no live "
+                "lookup was made. Use general travel knowledge and label it as non-live."
+            )
 
         prompt = FLIGHT_AGENT_PROMPT.format(
             query=query,
-            airport_data=str(airports)[:3000],
-            airline_data=str(airlines)[:3000],
+            route=route,
+            live_flight_data=live_flight_data,
         )
+        flight_data = _llm_text("You are an expert travel flight planner.", prompt)
 
-        response = llm.invoke(
-            [
-                SystemMessage(content="You are an expert travel flight planner."),
-                HumanMessage(content=prompt),
-            ]
-        )
-        flight_data = response.content
     except Exception as exc:
+        print(f"FLIGHT AGENT ERROR: {type(exc).__name__}: {exc}", flush=True)
         flight_data = f"Flight information unavailable: {exc}"
 
     return {
@@ -349,24 +440,163 @@ def flight_agent(state: TravelState):
     }
 
 
-# =========================
-# Hotel Agent - original behavior kept
-# =========================
-def hotel_agent(state: TravelState):
-    query = (
-        f"Best hotels for "
-        f"{state['user_query']}"
-    )
+def _try_json(value: Any) -> Any:
+    """Parse JSON from text or MCP content blocks. Returns None if not JSON."""
+    text = _content_to_text(value).strip()
+    if not text:
+        return None
 
     try:
-        hotel_results = asyncio.run(
-            tavily_mcp_search(query)
+        return json.loads(text)
+    except Exception:
+        pass
+
+    first, last = text.find("{"), text.rfind("}")
+    if first != -1 and last > first:
+        try:
+            return json.loads(text[first : last + 1])
+        except Exception:
+            return None
+
+    return None
+
+
+def _clean_snippet(text: Any, limit: int = 300) -> str:
+    """Strip web-page junk (image labels, link lines) from a search snippet."""
+    skip_exact = {"image", "check availability"}
+    kept = []
+
+    for line in str(text).splitlines():
+        # Keep the words of markdown headings (they often hold hotel names).
+        line = line.lstrip("#").strip()
+        if not line or line.lower() in skip_exact:
+            continue
+        if line.startswith("See "):
+            continue
+        # Image alt-text slugs such as "april-japan".
+        if " " not in line and "-" in line:
+            continue
+        kept.append(line)
+
+    snippet = re.sub(r"\s+", " ", " ".join(kept)).replace("[...]", "").strip()
+
+    if len(snippet) > limit:
+        snippet = snippet[:limit].rsplit(" ", 1)[0] + "..."
+
+    return snippet
+
+
+def _parse_search_results(raw: Any, min_score: float = 0.2, top: int = 5):
+    """Return the most relevant Tavily results as a list of dicts."""
+    data = _try_json(raw)
+    if not isinstance(data, dict):
+        return []
+
+    results = [
+        item
+        for item in data.get("results", [])
+        if isinstance(item, dict) and (item.get("score") or 0) >= min_score
+    ]
+    results.sort(key=lambda item: item.get("score") or 0, reverse=True)
+    return results[:top]
+
+
+def _format_weather(weather_raw: Any, forecast_raw: Any, city: str) -> str:
+    """Turn the weather MCP JSON into a short, readable Markdown block."""
+    current = _try_json(weather_raw)
+
+    if not isinstance(current, dict) or "temperature_c" not in current:
+        return (
+            f"Live weather for {city} could not be read. "
+            "Give general seasonal guidance instead."
         )
+
+    lines = [
+        f"**Today's live conditions in {current.get('city', city)}**",
+        "",
+        f"- Temperature: {current.get('temperature_c')}°C "
+        f"(feels like {current.get('feels_like_c')}°C)",
+        f"- Sky: {str(current.get('condition', 'n/a')).capitalize()}",
+        f"- Humidity: {current.get('humidity')}%",
+        f"- Wind: {current.get('wind_speed')} m/s",
+    ]
+
+    forecast = _try_json(forecast_raw)
+    entries = forecast.get("forecast", []) if isinstance(forecast, dict) else []
+
+    if entries:
+        lines += ["", "**Next few hours**", ""]
+        for item in entries:
+            try:
+                when = datetime.strptime(
+                    item["datetime"], "%Y-%m-%d %H:%M:%S"
+                ).strftime("%d %b, %H:%M")
+            except Exception:
+                when = str(item.get("datetime", ""))
+            lines.append(
+                f"- {when}: {item.get('temperature_c')}°C, "
+                f"{str(item.get('condition', '')).capitalize()}"
+            )
+
+    lines += [
+        "",
+        "_This is today's weather, not the forecast for your travel dates. "
+        "Use seasonal knowledge for the trip dates._",
+    ]
+    return "\n".join(lines)
+
+
+# =========================
+# Hotel Agent
+# =========================
+def hotel_agent(state: TravelState):
+    query = f"Best hotels for {state['user_query']}"
+
+    try:
+        raw_results = asyncio.run(tavily_mcp_search(query))
+        results = _parse_search_results(raw_results)
+
+        if results:
+            evidence = "\n\n".join(
+                f"{item.get('title', 'Untitled')} ({item.get('url', '')})\n"
+                f"{_clean_snippet(item.get('content', ''), 700)}"
+                for item in results
+            )
+
+            summary = _llm_text(
+                "You are a helpful travel hotel advisor.",
+                f"""
+Using only the search results below (ignore irrelevant ones), write clear
+hotel recommendations for this trip.
+
+Trip request:
+{state['user_query']}
+
+Search results:
+{evidence}
+
+Format:
+- A short heading per city or area, with 2-3 hotel bullets.
+- For each hotel: bold name, then one line on why it suits this trip.
+- Mention prices only if the results state them.
+- End with one practical booking tip.
+- Markdown only. No tables, no JSON.
+""",
+            )
+
+            sources = "\n".join(
+                f"- [{item.get('title', item.get('url', 'Source'))}]"
+                f"({item.get('url', '')})"
+                for item in results
+                if item.get("url")
+            )
+            hotel_results = f"{summary}\n\n**Sources**\n\n{sources}"
+        else:
+            hotel_results = _content_to_text(raw_results)
 
     except Exception as exc:
         print(
-            f"HOTEL AGENT MCP ERROR: "
-            f"{type(exc).__name__}: {exc}",
+            f"HOTEL AGENT MCP ERROR: {type(exc).__name__}: {exc}",
             flush=True,
         )
 
@@ -379,45 +609,25 @@ def hotel_agent(state: TravelState):
 
     return {
         "hotel_results": hotel_results,
-        "messages": [
-            AIMessage(
-                content="Hotel information processed."
-            )
-        ],
-        "llm_calls": (
-            state.get("llm_calls", 0) + 1
-        ),
+        "messages": [AIMessage(content="Hotel information processed.")],
+        "llm_calls": state.get("llm_calls", 0) + 1,
     }
+
+
 # =========================
 # Weather Agent
 # =========================
-
 def weather_agent(state: TravelState):
-    city = extract_destination(
-        state["user_query"]
-    )
+    city = extract_destination(state["user_query"])
 
     try:
-        weather_data = asyncio.run(
-            weather_mcp_search(city)
-        )
-
-        forecast_data = asyncio.run(
-            forecast_mcp_search(city)
-        )
-
-        weather_results = f"""
-Current Weather:
-{weather_data}
-
-Forecast:
-{forecast_data}
-"""
+        weather_raw = asyncio.run(weather_mcp_search(city))
+        forecast_raw = asyncio.run(forecast_mcp_search(city))
+        weather_results = _format_weather(weather_raw, forecast_raw, city)
 
     except Exception as exc:
         print(
-            f"WEATHER AGENT MCP ERROR: "
-            f"{type(exc).__name__}: {exc}",
+            f"WEATHER AGENT MCP ERROR: {type(exc).__name__}: {exc}",
             flush=True,
         )
 
@@ -430,16 +640,12 @@ Forecast:
 
     return {
         "weather_results": weather_results,
-        "messages": [
-            AIMessage(
-                content="Weather information processed."
-            )
-        ],
+        "messages": [AIMessage(content="Weather information processed.")],
     }
 
 
 # =========================
-# Budget Agent - new specialist
+# Budget Agent
 # =========================
 def budget_agent(state: TravelState):
     prompt = f"""
@@ -469,22 +675,17 @@ Return:
 If exact live prices are unavailable, clearly label estimates as approximate.
 """
 
-    response = llm.invoke(
-        [
-            SystemMessage(content="You are a practical travel budget analyst."),
-            HumanMessage(content=prompt),
-        ]
-    )
+    budget_text = _llm_text("You are a practical travel budget analyst.", prompt)
 
     return {
-        "budget_results": response.content,
+        "budget_results": budget_text,
         "messages": [AIMessage(content="Budget assessment generated.")],
         "llm_calls": state.get("llm_calls", 0) + 1,
     }
 
 
 # =========================
-# Itinerary Agent - original behavior extended with selected results
+# Itinerary Agent
 # =========================
 def itinerary_agent(state: TravelState):
     prompt = f"""
@@ -510,14 +711,11 @@ Budget Results:
 
 Make the itinerary practical, budget-aware, and easy to follow.
 Create a clear draft that is ready for human review.
+
+{DAY_FORMAT_RULES}
 """
 
-    response = llm.invoke(
-        [
-            SystemMessage(content="You are an expert travel planner."),
-            HumanMessage(content=prompt),
-        ]
-    )
+    itinerary_text = _llm_text("You are an expert travel planner.", prompt)
 
     approval_request = (
         "Please review the generated draft itinerary. Approve it to create the "
@@ -525,7 +723,7 @@ Create a clear draft that is ready for human review.
     )
 
     return {
-        "itinerary": response.content,
+        "itinerary": itinerary_text,
         "approval_request": approval_request,
         "messages": [AIMessage(content="Draft itinerary created for human review.")],
         "llm_calls": state.get("llm_calls", 0) + 1,
@@ -562,7 +760,7 @@ def human_approval_agent(state: TravelState):
 
 
 # =========================
-# Final Response Agent - original format kept, HITL feedback added
+# Final Response Agent
 # =========================
 def final_agent(state: TravelState):
     if state.get("approved", False):
@@ -617,20 +815,21 @@ Important:
 - Include weather-based travel advice.
 - Keep the response useful for real travel planning.
 - Incorporate the human feedback when revision was requested.
+- Do NOT use a table for the day-by-day itinerary; use the day format below.
+- A table is allowed only for Estimated Budget (header row, a |---|---| separator row, one row per line).
+- Keep Flight, Hotel and Weather sections short and readable (bullets, no raw data).
+
+{DAY_FORMAT_RULES}
 """
 
-    response = llm.invoke(
-        [
-            SystemMessage(
-                content="You are a professional AI travel booking assistant."
-            ),
-            HumanMessage(content=final_prompt),
-        ]
+    final_text = _llm_text(
+        "You are a professional AI travel booking assistant.",
+        final_prompt,
     )
 
     return {
-        "final_response": response.content,
-        "messages": [response],
+        "final_response": final_text,
+        "messages": [AIMessage(content=final_text)],
         "llm_calls": state.get("llm_calls", 0) + 1,
     }
 
@@ -711,8 +910,9 @@ graph.add_edge("human_approval", "final_agent")
 graph.add_edge("final_agent", END)
 graph.add_edge("guardrail_blocked", END)
 
+
 # =========================
-# PostgreSQL Checkpointer - original persistence kept
+# PostgreSQL Checkpointer
 # =========================
 DATABASE_URL = get_database_url()
 _conn = psycopg.connect(
@@ -744,7 +944,7 @@ def _serialize_result(
     thread_id: str,
 ) -> dict[str, Any]:
     messages = result.get("messages", [])
-    last_message = messages[-1].content if messages else ""
+    last_message = _content_to_text(messages[-1].content) if messages else ""
     answer = result.get("final_response") or last_message
     interrupt_payload = _interrupt_payload(result)
 
@@ -755,18 +955,18 @@ def _serialize_result(
 
     return {
         "thread_id": thread_id,
-        "answer": answer,
+        "answer": _content_to_text(answer),
         "requires_approval": interrupt_payload is not None,
         "approval_request": (
             interrupt_payload.get("approval_request", "")
             if interrupt_payload
             else result.get("approval_request", "")
         ),
-        "flight_results": result.get("flight_results", ""),
-        "hotel_results": result.get("hotel_results", ""),
-        "weather_results": result.get("weather_results", ""),
-        "budget_results": result.get("budget_results", ""),
-        "itinerary": (
+        "flight_results": _content_to_text(result.get("flight_results", "")),
+        "hotel_results": _content_to_text(result.get("hotel_results", "")),
+        "weather_results": _content_to_text(result.get("weather_results", "")),
+        "budget_results": _content_to_text(result.get("budget_results", "")),
+        "itinerary": _content_to_text(
             interrupt_payload.get("draft_itinerary", "")
             if interrupt_payload
             else result.get("itinerary", "")
