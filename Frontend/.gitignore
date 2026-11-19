@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+
+# Testing
+coverage/
+
+# Production builds
+build/
+dist/
+
+# Environment variables & secrets
+.env
+
+
+
